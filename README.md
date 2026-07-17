@@ -285,16 +285,6 @@ IBM_WEATHER_URL=
 
 ---
 
-# 📷 Screenshots
-
-Add screenshots here:
-
-- Dashboard
-- Login
-- Weather Panel
-- AI Chatbot
-- Firebase Database
-- ESP32 Serial Monitor
 
 ---
 
