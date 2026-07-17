@@ -302,8 +302,6 @@ Add screenshots here:
 
 **Project Name:** DVR Smart Farming
 
-**Hackathon:** MRUH Hackathon 2026
-
 **Developed By:** Team DVR Smart Farming
 
 ---
