@@ -1,0 +1,374 @@
+import { useState, useEffect, useRef } from "react";
+import { base44 } from "@/api/base44Client";
+import { CROP_PROFILES } from "@/lib/farmingData";
+import { generateGeminiInsights } from "@/lib/geminiInsights";
+import { fetchWeatherForecast } from "@/lib/weatherService";
+import { listenToNodes, setNodePumpRelay, FIELD_NODES, NODE_BASE_PATH } from "@/lib/firebase";
+import DashboardHeader from "@/components/farming/DashboardHeader";
+import NodeSelector from "@/components/farming/NodeSelector";
+import NodeHealthMatrix from "@/components/farming/NodeHealthMatrix";
+import MoistureCard from "@/components/farming/MoistureCard";
+import TemperatureCard from "@/components/farming/TemperatureCard";
+import HumidityCard from "@/components/farming/HumidityCard";
+import CameraFeed from "@/components/farming/CameraFeed";
+import WeatherForecast from "@/components/farming/WeatherForecast";
+import AIInsights from "@/components/farming/AIInsights";
+import AgronomistChat from "@/components/farming/AgronomistChat";
+import IrrigationControl from "@/components/farming/IrrigationControl";
+import FirebaseSnippet from "@/components/farming/FirebaseSnippet";
+import MoistureAlertBanner from "@/components/farming/MoistureAlertBanner";
+import MoistureAlertSettings from "@/components/farming/MoistureAlertSettings";
+import WaterUsageChart from "@/components/farming/WaterUsageChart";
+import { Wifi, WifiOff } from "lucide-react";
+
+// Build the initial node map from the field topology so every zone shows
+// (as Offline) even before Firebase delivers data for it.
+function buildInitialNodes() {
+  const init = {};
+  FIELD_NODES.forEach((n) => {
+    init[n.id] = {
+      id: n.id,
+      name: n.name,
+      moisture: null,
+      temperature: null,
+      humidity: null,
+      pump: "OFF",
+      camera_frame: null,
+    };
+  });
+  return init;
+}
+
+const hasValue = (val) => val != null && val !== "No data detected" && val !== "" && !Number.isNaN(val);
+
+export default function Dashboard() {
+  const [selectedCrop, setSelectedCrop] = useState("tomatoes");
+  const [nodes, setNodes] = useState(buildInitialNodes);
+  const [selectedNodeId, setSelectedNodeId] = useState(FIELD_NODES[0].id);
+  const [forecast, setForecast] = useState([]);
+  const [insights, setInsights] = useState([]);
+  const [insightsLoading, setInsightsLoading] = useState(false);
+  const [firebaseStatus, setFirebaseStatus] = useState("connecting"); // connecting | live | offline
+  const [irrigationLog, setIrrigationLog] = useState([]); // { nodeId, nodeName, type, moisture, time }
+  const [waterUsageRecords, setWaterUsageRecords] = useState([]);
+
+  const pumpStartTimesRef = useRef({}); // { [nodeId]: Date }
+  const prevPumpStatesRef = useRef({}); // { [nodeId]: boolean }
+  const GALLONS_PER_MINUTE = 2;
+
+  const activeNode = nodes[selectedNodeId];
+  const cropProfile = CROP_PROFILES[selectedCrop];
+
+  // Whether the active zone has received ANY live telemetry from Firebase
+  const activeNodeHasData =
+    activeNode?.moisture != null ||
+    activeNode?.temperature != null ||
+    activeNode?.humidity != null;
+
+  // Load water usage records
+  const loadWaterUsage = async () => {
+    const records = await base44.entities.WaterUsage.list("-date", 100);
+    setWaterUsageRecords(records);
+  };
+
+  const saveWaterUsage = async (gallons, minutes, zone) => {
+    const today = new Date().toISOString().split("T")[0];
+    await base44.entities.WaterUsage.create({
+      zone,
+      date: today,
+      gallons,
+      duration_minutes: Math.round(minutes * 10) / 10,
+      crop: selectedCrop,
+    });
+    loadWaterUsage();
+  };
+
+  useEffect(() => {
+    loadWaterUsage();
+  }, []);
+
+  // Weather forecast from OpenWeather API (refreshes every 30 min)
+  useEffect(() => {
+    const loadWeather = async () => {
+      const data = await fetchWeatherForecast();
+      setForecast(data);
+    };
+    loadWeather();
+    const interval = setInterval(loadWeather, 30 * 60 * 1000);
+    return () => clearInterval(interval);
+  }, []);
+
+  // Firebase real-time listener for ALL nodes under /farm/nodes
+  useEffect(() => {
+    const unsub = listenToNodes((data) => {
+      setNodes((prev) => {
+        const next = { ...prev };
+        let anyLive = false;
+
+        FIELD_NODES.forEach((config) => {
+          const remote = data[config.id];
+          const merged = { ...next[config.id] };
+
+          if (remote) {
+            if (hasValue(remote.name)) merged.name = remote.name;
+            if (hasValue(remote.moisture)) merged.moisture = remote.moisture;
+            if (hasValue(remote.temperature)) merged.temperature = remote.temperature;
+            if (hasValue(remote.humidity)) merged.humidity = remote.humidity;
+            if (hasValue(remote.pump)) merged.pump = remote.pump;
+            if (remote.camera_frame) merged.camera_frame = remote.camera_frame;
+            if (hasValue(remote.moisture) || hasValue(remote.temperature) || hasValue(remote.humidity)) {
+              anyLive = true;
+            }
+          }
+          next[config.id] = merged;
+        });
+
+        if (anyLive) setFirebaseStatus("live");
+        return next;
+      });
+    });
+
+    // Timeout: if no data in 5s, mark offline
+    const timeout = setTimeout(() => {
+      setFirebaseStatus((s) => (s === "connecting" ? "offline" : s));
+    }, 5000);
+
+    return () => {
+      unsub();
+      clearTimeout(timeout);
+    };
+  }, []);
+
+  // Detect pump state transitions per node → log events + track water usage
+  useEffect(() => {
+    const now = new Date();
+    Object.values(nodes).forEach((node) => {
+      const isActive = node.pump === "ON" || node.pump === true;
+      const prevActive = prevPumpStatesRef.current[node.id] ?? false;
+
+      if (isActive !== prevActive) {
+        setIrrigationLog((log) => [
+          ...log,
+          {
+            nodeId: node.id,
+            nodeName: node.name,
+            type: isActive ? "start" : "stop",
+            moisture: node.moisture ?? 0,
+            time: now,
+          },
+        ]);
+
+        if (isActive) {
+          pumpStartTimesRef.current[node.id] = now;
+        } else if (pumpStartTimesRef.current[node.id]) {
+          const start = pumpStartTimesRef.current[node.id];
+          const minutes = (now - start) / 60000;
+          const gallons = Math.round(minutes * GALLONS_PER_MINUTE * 10) / 10;
+          if (gallons > 0.05) {
+            saveWaterUsage(gallons, minutes, node.name);
+          }
+          delete pumpStartTimesRef.current[node.id];
+        }
+
+        prevPumpStatesRef.current[node.id] = isActive;
+      }
+    });
+  }, [nodes]);
+
+  // Autonomous irrigation controller — runs INDEPENDENTLY for EACH node.
+  // Cross-analyzes each node's moisture with the OpenWeather forecast.
+  useEffect(() => {
+    if (!forecast.length) return;
+    const profile = CROP_PROFILES[selectedCrop];
+    const today = forecast[0];
+    const heavyRainExpectedSoon = (today?.rainfall6hForecast ?? 0) >= 10;
+    const noRainExpected = (today?.rainfall6hForecast ?? 0) === 0;
+
+    Object.values(nodes).forEach((node) => {
+      if (node.moisture == null) return;
+
+      const isActive = node.pump === "ON" || node.pump === true;
+      const shouldStart =
+        (node.moisture < profile.moisture.critical_low ||
+          (node.moisture < profile.moisture.ideal_low && noRainExpected)) &&
+        !heavyRainExpectedSoon;
+      const shouldStop = node.moisture >= profile.moisture.ideal_high;
+
+      if (shouldStart && !isActive) {
+        setNodePumpRelay(node.id, true);
+      } else if (shouldStop && isActive) {
+        setNodePumpRelay(node.id, false);
+      }
+    });
+  }, [nodes, selectedCrop, forecast]);
+
+  // AI insights for the currently selected node (powered by Gemini)
+  useEffect(() => {
+    if (!forecast.length || activeNode?.moisture == null) {
+      setInsights([]);
+      return;
+    }
+    let cancelled = false;
+    setInsightsLoading(true);
+    const profile = CROP_PROFILES[selectedCrop];
+    generateGeminiInsights(
+      {
+        moisture: activeNode.moisture,
+        temperature: activeNode.temperature,
+        humidity: activeNode.humidity,
+      },
+      profile,
+      forecast
+    )
+      .then((generated) => {
+        if (!cancelled) {
+          setInsights(generated);
+          setInsightsLoading(false);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setInsightsLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeNode?.moisture, activeNode?.temperature, activeNode?.humidity, selectedNodeId, selectedCrop, forecast]);
+
+  // Display values for the active node — show placeholder dashes until data arrives
+  const displayData = {
+    moisture: activeNode?.moisture ?? "--",
+    temperature: activeNode?.temperature ?? "--",
+    humidity: activeNode?.humidity ?? "--",
+    pumpActive: activeNode?.pump === "ON" || activeNode?.pump === true,
+  };
+
+  const nodeIrrigationLog = irrigationLog.filter((e) => e.nodeId === selectedNodeId);
+
+  return (
+    <div className="relative min-h-screen">
+      {/* Background */}
+      <div className="fixed inset-0 z-0">
+        <img
+          src="https://images.unsplash.com/photo-1500382017468-9049fed747ef?w=1920&q=80"
+          alt="Farmland background"
+          className="w-full h-full object-cover"
+        />
+        <div className="absolute inset-0 bg-background/92 backdrop-blur-sm" />
+      </div>
+
+      {/* Content */}
+      <div className="relative z-10 max-w-7xl mx-auto px-3 md:px-6 py-4 md:py-6 space-y-4 md:space-y-6">
+        <DashboardHeader
+          selectedCrop={selectedCrop}
+          onCropChange={setSelectedCrop}
+          firebaseStatus={firebaseStatus}
+        />
+
+        {/* Zone / Node selector */}
+        <NodeSelector
+          nodes={nodes}
+          selectedNodeId={selectedNodeId}
+          onSelectNode={setSelectedNodeId}
+        />
+
+        {/* Firebase status banner */}
+        {firebaseStatus === "offline" && (
+          <div className="flex items-center gap-2 bg-yellow-500/10 border border-yellow-500/30 rounded-xl px-4 py-3">
+            <WifiOff className="h-4 w-4 text-yellow-400 flex-shrink-0" />
+            <p className="text-xs text-yellow-400">
+              No data received from Firebase yet. Check your ESP32 connection and database rules.
+              Listening on: <span className="font-mono">{NODE_BASE_PATH}/</span>
+            </p>
+          </div>
+        )}
+        {firebaseStatus === "live" && (
+          <div className="flex items-center gap-2 bg-primary/5 border border-primary/20 rounded-xl px-4 py-3">
+            <Wifi className="h-4 w-4 text-primary flex-shrink-0" />
+            <p className="text-xs text-primary">
+              Live data streaming from Firebase Realtime Database · {FIELD_NODES.length} nodes monitored · roof-top-farming
+            </p>
+          </div>
+        )}
+
+        {/* Field overview — all nodes at a glance */}
+        <NodeHealthMatrix
+          nodes={nodes}
+          selectedNodeId={selectedNodeId}
+          onSelectNode={setSelectedNodeId}
+          cropProfile={cropProfile}
+        />
+
+        {/* Moisture alert banner (scoped to active node) */}
+        <MoistureAlertBanner
+          moisture={displayData.moisture}
+          selectedCrop={selectedCrop}
+          pumpActive={displayData.pumpActive}
+          onTriggerIrrigation={() => setNodePumpRelay(selectedNodeId, true)}
+        />
+
+        {/* Zone empty state — selected zone has no telemetry yet */}
+        {!activeNodeHasData && firebaseStatus !== "connecting" && (
+          <div className="bg-yellow-500/10 border border-yellow-500/30 rounded-xl px-4 py-4 flex items-center gap-3">
+            <WifiOff className="h-5 w-5 text-yellow-400 flex-shrink-0" />
+            <div>
+              <p className="text-sm font-semibold text-yellow-400">
+                No live telemetry received from {activeNode?.name ?? "this zone"} yet.
+              </p>
+              <p className="text-xs text-yellow-400/80 mt-0.5">
+                Ensure your ESP32 is powered on and transmitting to <span className="font-mono">/farm/nodes/{selectedNodeId}/</span>
+              </p>
+            </div>
+          </div>
+        )}
+
+        {/* Telemetry cards (active node) */}
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+          <MoistureCard value={activeNodeHasData ? activeNode?.moisture : null} cropProfile={cropProfile} />
+          <TemperatureCard value={activeNodeHasData ? activeNode?.temperature : null} cropProfile={cropProfile} />
+          <HumidityCard value={activeNodeHasData ? activeNode?.humidity : null} cropProfile={cropProfile} />
+        </div>
+
+        {/* Camera + Irrigation (active node) */}
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+          <CameraFeed base64Frame={activeNode?.camera_frame} nodeName={activeNode?.name} />
+          <IrrigationControl
+            pumpActive={displayData.pumpActive}
+            irrigationLog={nodeIrrigationLog}
+            nodeName={activeNode?.name}
+            nodeId={selectedNodeId}
+          />
+        </div>
+
+        {/* Weather */}
+        <WeatherForecast forecast={forecast} />
+
+        {/* Water Usage */}
+        <WaterUsageChart records={waterUsageRecords} />
+
+        {/* AI Agronomist — insights + live-context chat */}
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 items-start">
+          <AIInsights insights={insights} loading={insightsLoading} />
+          <AgronomistChat
+            sensorData={{
+              moisture: activeNode?.moisture ?? null,
+              temperature: activeNode?.temperature ?? null,
+              humidity: activeNode?.humidity ?? null,
+            }}
+            cropProfile={cropProfile}
+          />
+        </div>
+
+        {/* Moisture Alert Settings */}
+        <MoistureAlertSettings selectedCrop={selectedCrop} />
+
+        {/* Firebase code snippet */}
+        <FirebaseSnippet />
+
+        <footer className="text-center py-6 border-t border-border/20">
+          <p className="text-xs text-muted-foreground">
+            DVR Smart Farming Solutions · ESP32 IoT Platform · AI-Powered Autonomous Agriculture
+          </p>
+        </footer>
+      </div>
+    </div>
+  );
