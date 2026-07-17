@@ -1,0 +1,66 @@
+{
+  "farm": {
+    "nodes": {
+      "node_01": {
+        "device_status": "OFFLINE",
+        "humidity": "Data not received",
+        "id": "node_01",
+        "last_updated": 1783187542191,
+        "moisture": "Data not received",
+        "name": "Zone 1 - North Field",
+        "pump": "OFF",
+        "pump_reason": "Data not received",
+        "source": "hardware",
+        "temperature": "Data not received"
+      },
+      "node_02": {
+        "device_status": "OFFLINE",
+        "humidity": "Data not received",
+        "id": "node_02",
+        "last_updated": 0,
+        "moisture": "Data not received",
+        "name": "Zone 2 - South Field",
+        "pump": "OFF",
+        "pump_reason": "Data not received",
+        "source": "hardware",
+        "temperature": "Data not received"
+      },
+      "node_03": {
+        "device_status": "OFFLINE",
+        "humidity": "Data not received",
+        "id": "node_03",
+        "last_updated": 0,
+        "moisture": "Data not received",
+        "name": "Zone 3 - East Field",
+        "pump": "OFF",
+        "pump_reason": "Data not received",
+        "source": "hardware",
+        "temperature": "Data not received"
+      },
+      "node_04": {
+        "device_status": "OFFLINE",
+        "humidity": "Data not received",
+        "id": "node_04",
+        "last_updated": 0,
+        "moisture": "Data not received",
+        "name": "Zone 4 - West Field",
+        "pump": "OFF",
+        "pump_reason": "Data not received",
+        "source": "hardware",
+        "temperature": "Data not received"
+      },
+      "node_05": {
+        "device_status": "OFFLINE",
+        "humidity": "Data not received",
+        "id": "node_05",
+        "last_updated": 0,
+        "moisture": "Data not received",
+        "name": "Zone 5 - Center Field",
+        "pump": "OFF",
+        "pump_reason": "Data not received",
+        "source": "hardware",
+        "temperature": "Data not received"
+      }
+    }
+  }
+}
