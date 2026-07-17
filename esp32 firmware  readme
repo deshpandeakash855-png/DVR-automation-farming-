@@ -1,0 +1,29 @@
+# ESP32 Firmware
+
+## Hardware
+- ESP32-WROOM
+- DHT11 Sensor
+- Soil Moisture Sensor
+- Relay Module
+- Water Pump
+
+## Features
+- Wi-Fi connectivity
+- Firebase Realtime Database
+- Automatic irrigation
+- Temperature monitoring
+- Humidity monitoring
+- Soil moisture monitoring
+- Device status reporting
+
+## Pin Configuration
+
+| Component | GPIO |
+|----------|------|
+| DHT11 | GPIO 4 |
+| Soil Moisture | GPIO 34 |
+| Relay | GPIO 26 |
+
+## Upload
+
+Open `DVR_Smart_Farming.ino` in Arduino IDE and upload to ESP32 after configuring your own Wi-Fi and Firebase credentials.
