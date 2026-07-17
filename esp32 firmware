@@ -1,0 +1,264 @@
+#include <WiFi.h>
+#include <esp_system.h>
+#include <Firebase_ESP_Client.h>
+#include <addons/TokenHelper.h>
+#include <addons/RTDBHelper.h>
+#include <DHT.h>
+
+// WiFi
+#define WIFI_SSID "wifi name"
+#define WIFI_PASSWORD "wifi password"
+
+// Firebase
+#define API_KEY "my api key"
+#define DATABASE_URL "my firebase url"
+#define USER_EMAIL "your email id"
+#define USER_PASSWORD "email id password"
+
+// Node identity
+#define NODE_ID "node_01"
+#define NODE_NAME "Zone 1 - North Field"
+
+// Hardware (ESP32-WROOM)
+#define DHTPIN 4
+#define DHTTYPE DHT11
+#define SOIL_PIN 34   // ADC1, input only
+#define PUMP_PIN 26
+
+// Soil: lower reading = wetter on most resistive probes (tune in Serial Monitor).
+const int WET_THRESHOLD = 2800;
+const float TEMP_HIGH_LIMIT = 30.0;
+const float HUMIDITY_HIGH_LIMIT = 80.0;
+
+const unsigned long UPLOAD_INTERVAL_MS = 10000;
+const unsigned long AUTH_RETRY_MS = 30000;
+const bool TREAT_MAX_ADC_AS_NO_DATA = true;
+
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+DHT dht(DHTPIN, DHTTYPE);
+
+unsigned long lastUploadMs = 0;
+unsigned long lastAuthRetryMs = 0;
+
+// Required for email/password auth — was missing in original sketch.
+void tokenStatusCallback(TokenInfo info) {
+  if (info.status == token_status_error) {
+    Serial.print("Token error: ");
+    Serial.println(info.error.message.c_str());
+  }
+}
+
+const char *resetReasonToString(esp_reset_reason_t reason) {
+  switch (reason) {
+    case ESP_RST_POWERON:   return "Power-on";
+    case ESP_RST_EXT:       return "External";
+    case ESP_RST_SW:        return "Software";
+    case ESP_RST_PANIC:     return "Panic";
+    case ESP_RST_INT_WDT:   return "Interrupt WDT";
+    case ESP_RST_TASK_WDT:  return "Task WDT";
+    case ESP_RST_WDT:       return "WDT";
+    case ESP_RST_DEEPSLEEP: return "Deep sleep wake";
+    case ESP_RST_BROWNOUT:  return "Brownout";
+    default:                return "Unknown";
+  }
+}
+
+void connectWiFi() {
+  if (WiFi.status() == WL_CONNECTED) {
+    return;
+  }
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  Serial.print("Connecting to WiFi");
+  unsigned long start = millis();
+
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 20000) {
+    delay(500);
+    Serial.print(".");
+    yield();
+  }
+
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("WiFi connected");
+    Serial.print("IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.print("WiFi failed, status: ");
+    Serial.println(WiFi.status());
+  }
+}
+
+void beginFirebase() {
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+  config.token_status_callback = tokenStatusCallback;
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+}
+
+void ensureFirebase() {
+  if (Firebase.ready()) {
+    return;
+  }
+  if (millis() - lastAuthRetryMs < AUTH_RETRY_MS) {
+    return;
+  }
+  lastAuthRetryMs = millis();
+  Serial.println("Firebase not ready, re-authenticating...");
+  beginFirebase();
+}
+
+bool uploadNodeData(bool allDataOk, float t, float h, int moisture, const String &pump, const String &reason) {
+  FirebaseJson json;
+  String path = String("/farm/nodes/") + NODE_ID;
+
+  json.set("id", NODE_ID);
+  json.set("name", NODE_NAME);
+  json.set("source", "hardware");
+
+  if (allDataOk) {
+    json.set("device_status", "ONLINE");
+    json.set("temperature", t);
+    json.set("humidity", h);
+    json.set("moisture", moisture);
+    json.set("pump", pump);
+    json.set("pump_reason", reason);
+  } else {
+    json.set("device_status", "OFFLINE");
+    json.set("temperature", "Data not received");
+    json.set("humidity", "Data not received");
+    json.set("moisture", "Data not received");
+    json.set("pump", "OFF");
+    json.set("pump_reason", "Data not received");
+  }
+
+  FirebaseJson serverTimestamp;
+  serverTimestamp.set(".sv", "timestamp");
+  json.set("last_updated", serverTimestamp);
+
+  return Firebase.RTDB.setJSON(&fbdo, path.c_str(), &json);
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(2000);
+  Serial.println();
+  Serial.println("=== NODE 01 BOOT (ESP32) ===");
+  Serial.print("Reset reason: ");
+  Serial.println(resetReasonToString(esp_reset_reason()));
+
+  pinMode(PUMP_PIN, OUTPUT);
+  digitalWrite(PUMP_PIN, HIGH); // active LOW relay
+
+  // Use full 0-3.3 V ADC range on GPIO 34 (12-bit: 0-4095).
+  analogSetAttenuation(ADC_11db);
+
+  dht.begin();
+  delay(2000);
+
+  Serial.println("Starting WiFi...");
+  connectWiFi();
+
+  Serial.println("Configuring Firebase...");
+  fbdo.setBSSLBufferSize(4096, 1024);
+  fbdo.setResponseSize(4096);
+
+  beginFirebase();
+
+  Serial.print("Authenticating");
+  unsigned long authStart = millis();
+
+  while (!Firebase.ready() && millis() - authStart < 15000) {
+    Serial.print(".");
+    delay(500);
+    yield();
+  }
+
+  Serial.println();
+
+  if (Firebase.ready()) {
+    Serial.println("Firebase ready");
+  } else {
+    Serial.println("Firebase auth timeout - will retry in loop");
+  }
+}
+
+void loop() {
+  connectWiFi();
+  ensureFirebase();
+
+  if (millis() - lastUploadMs < UPLOAD_INTERVAL_MS) {
+    yield();
+    return;
+  }
+  lastUploadMs = millis();
+
+  Serial.println();
+  Serial.println("--- Reading sensors ---");
+
+  float t = dht.readTemperature();
+  float h = dht.readHumidity();
+  int moisture = analogRead(SOIL_PIN);
+
+  bool tempOk = !isnan(t);
+  bool humOk = !isnan(h);
+  bool moistureOk = !(TREAT_MAX_ADC_AS_NO_DATA && moisture >= 4095);
+  bool allDataOk = tempOk && humOk && moistureOk;
+
+  String pump = "OFF";
+  String reason = "Data not received";
+
+  digitalWrite(PUMP_PIN, HIGH);
+
+  if (allDataOk) {
+    if (h >= HUMIDITY_HIGH_LIMIT) {
+      reason = "Humidity high";
+    } else if (moisture <= WET_THRESHOLD) {
+      reason = "Soil wet enough";
+    } else if (t < TEMP_HIGH_LIMIT) {
+      reason = "Temperature not high enough";
+    } else {
+      digitalWrite(PUMP_PIN, LOW);
+      pump = "ON";
+      reason = "Soil dry, temp high, humidity normal";
+    }
+  }
+
+  Serial.print("Node: ");
+  Serial.print(NODE_ID);
+  Serial.print(" | Status: ");
+  Serial.println(allDataOk ? "ONLINE" : "OFFLINE");
+
+  Serial.printf(
+    "Temp: %s | Humidity: %s | Moisture: %s | Pump: %s | Reason: %s\n",
+    allDataOk ? String(t, 1).c_str() : "N/A",
+    allDataOk ? String(h, 1).c_str() : "N/A",
+    allDataOk ? String(moisture).c_str() : "N/A",
+    allDataOk ? pump.c_str() : "OFF",
+    allDataOk ? reason.c_str() : "Data not received");
+
+  if (!Firebase.ready()) {
+    Serial.println("Firebase not ready, skipping upload");
+    yield();
+    return;
+  }
+
+  if (uploadNodeData(allDataOk, t, h, moisture, pump, reason)) {
+    Serial.println("Firebase upload OK");
+  } else {
+    Serial.print("Upload failed: ");
+    Serial.println(fbdo.errorReason());
+  }
+
+  yield();
+}
