@@ -1,6 +1,17 @@
 # 🌱 DVR Smart Farming
 
+## Live Demo
 
+Platform: Base44
+
+Live Dashboard:
+https:https://dvr-smart-farming-copy-cb6d24fd.base44.app
+
+Features:
+• Real-time sensor monitoring
+• AI-powered recommendations
+• Weather forecasting
+• Automatic irrigation control
 
 ### AI & IoT Powered Smart Farming Platform
 
